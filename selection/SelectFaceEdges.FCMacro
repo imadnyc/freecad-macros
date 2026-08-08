@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Select all edges of the currently selected face(s).
+
+FreeCAD makes it easy to pick a face and much harder to pick the thin
+edges around it (FreeCAD issue #29353).  Select faces, run this, and
+every edge bounding them is selected.
+"""
+
+__Name__ = "SelectFaceEdges"
+__Comment__ = "Select every edge of the currently selected faces"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import FreeCAD
+
+# ---------------------------------------------------------------- geometry
+
+def face_edges(faces):
+    """Unique edges bounding the given faces (OCC seam repeats collapsed)."""
+    out = {}
+    for face in faces:
+        for edge in face.Edges:
+            out.setdefault(edge.hashCode(), edge)
+    return list(out.values())
+
+
+# --------------------------------------------------------------- gui glue
+
+def run():
+    try:
+        import FreeCADGui
+    except ImportError:
+        FreeCAD.Console.PrintMessage(
+            "SelectFaceEdges: needs the FreeCAD GUI.\n")
+        return
+    picks = {}  # (doc name, obj name) -> (obj, set of 1-based face indices)
+    for sel in FreeCADGui.Selection.getSelectionEx():
+        obj = sel.Object
+        if not hasattr(obj, "Shape"):
+            continue
+        for sub in sel.SubElementNames:
+            if sub.startswith("Face") and sub[4:].isdigit():
+                key = (obj.Document.Name, obj.Name)
+                picks.setdefault(key, (obj, set()))[1].add(int(sub[4:]))
+    if not picks:
+        FreeCAD.Console.PrintMessage(
+            "SelectFaceEdges: select one or more faces first.\n")
+        return
+
+    face_count = edge_count = 0
+    for (doc_name, obj_name), (obj, indices) in picks.items():
+        shape = obj.Shape
+        n = len(shape.Faces)
+        faces = [shape.Faces[i - 1] for i in indices if 1 <= i <= n]
+        if not faces:
+            continue
+        edge_index = {e.hashCode(): i for i, e in enumerate(shape.Edges, 1)}
+        found = face_edges(faces)
+        for edge in found:
+            i = edge_index.get(edge.hashCode())
+            if i:
+                FreeCADGui.Selection.addSelection(doc_name, obj_name, f"Edge{i}")
+        face_count += len(faces)
+        edge_count += len(found)
+    FreeCAD.Console.PrintMessage(
+        f"SelectFaceEdges: {face_count} face(s) -> {edge_count} edge(s).\n")
+
+
+if FreeCAD.GuiUp:
+    run()

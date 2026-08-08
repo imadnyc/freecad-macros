@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Toggle: Alt+pick selects the whole tangent chain.
+
+Run once to turn on.  While on, picking an edge or face in the 3D view
+with Alt held expands the pick to its tangent-continuous chain (same
+logic as SelectTangentEdges / SelectTangentFaces).  Picks without Alt
+behave normally.  Run the macro again to turn off.
+
+The observer handle lives on the FreeCAD module, so the toggle works
+even though re-running the macro re-executes this file from scratch.
+
+The tolerance is the float parameter AngleTolerance (degrees) under
+"User parameter:BaseApp/SmartSelect", default 5; one knob tunes the
+whole smart-selection suite, and it is re-read on every pick.
+"""
+
+__Name__ = "AltChainSelect"
+__Comment__ = "Toggle: Alt+picking an edge or face selects its tangent chain"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import math
+
+import FreeCAD
+
+SAMPLES = 3  # points sampled along a shared edge for the face G1 test
+
+_ALT_ATTR = "_altChainSelectObserver"
+
+
+def _tolerance():
+    """Suite-wide angle tolerance in degrees (AngleTolerance parameter)."""
+    return FreeCAD.ParamGet(
+        "User parameter:BaseApp/SmartSelect").GetFloat("AngleTolerance", 5.0)
+
+
+# ------------------------------------------------- geometry (edge chains)
+# same core as SelectTangentEdges.FCMacro; copied so this macro stays a
+# single shareable file
+
+def _end_tangents(edge):
+    """(vertex hashCode, unit tangent) for each end of `edge`.
+
+    Degenerate edges (zero-length seams, sphere poles) raise on curve
+    access; they yield [] and drop out of the chain graph.
+    """
+    if not edge.Vertexes:
+        return []
+    try:
+        params = (edge.FirstParameter, edge.LastParameter)
+    except Exception:
+        return []
+    ends = []
+    for par in params:
+        try:
+            point = edge.valueAt(par)
+            tang = edge.tangentAt(par)
+        except Exception:
+            continue
+        if tang.Length < 1e-9:
+            continue
+        tang.normalize()
+        # curve endpoints only approximate the vertex position, but the
+        # vertex hashCode is shared exactly between adjacent edges, so
+        # snap to the nearest vertex and key on that
+        vert = min(edge.Vertexes, key=lambda v: (v.Point - point).Length)
+        ends.append((vert.hashCode(), tang))
+    return ends
+
+
+def tangent_edge_chain(shape, seed_edges, tol_deg=5.0):
+    """All edges of `shape` reachable from `seed_edges` across vertices
+    where the meeting edges are tangent within `tol_deg` degrees
+    (orientation-agnostic).  Returns a list of edges including the seeds.
+    """
+    # the -1e-9 keeps exactly-tangent junctions (|dot| == 1.0) selectable
+    # even at tol_deg = 0
+    cos_tol = math.cos(math.radians(tol_deg)) - 1e-9
+    edges = {}  # hashCode -> Edge; dedupes seam repeats, drops degenerates
+    for edge in shape.Edges:
+        try:
+            if edge.Length < 1e-9:
+                continue
+        except Exception:
+            continue
+        edges.setdefault(edge.hashCode(), edge)
+    ends = {h: _end_tangents(e) for h, e in edges.items()}
+    at_vertex = {}  # vertex hashCode -> [(edge hashCode, unit tangent)]
+    for h, edge_ends in ends.items():
+        for vert_hash, tang in edge_ends:
+            at_vertex.setdefault(vert_hash, []).append((h, tang))
+
+    chain = set()
+    stack = []
+    for seed in seed_edges:
+        h = seed.hashCode()
+        if h in edges and h not in chain:
+            chain.add(h)
+            stack.append(h)
+    while stack:
+        h = stack.pop()
+        for vert_hash, tang in ends[h]:
+            for other, other_tang in at_vertex[vert_hash]:
+                if other not in chain and abs(tang.dot(other_tang)) >= cos_tol:
+                    chain.add(other)
+                    stack.append(other)
+    return [edges[h] for h in chain]
+
+
+# ------------------------------------------------- geometry (face chains)
+# same core as SelectTangentFaces.FCMacro
+
+def _g1_across(face_a, face_b, edge, cos_tol, samples=SAMPLES):
+    """True if both faces' surface normals agree (up to sign) at `samples`
+    interior points of the shared edge."""
+    try:
+        lo, hi = edge.FirstParameter, edge.LastParameter
+    except Exception:
+        return False
+    for i in range(samples):
+        par = lo + (hi - lo) * (i + 1.0) / (samples + 1.0)
+        try:
+            point = edge.valueAt(par)
+            norm_a = face_a.normalAt(*face_a.Surface.parameter(point))
+            norm_b = face_b.normalAt(*face_b.Surface.parameter(point))
+            norm_a.normalize()
+            norm_b.normalize()
+        except Exception:
+            return False
+        if abs(norm_a.dot(norm_b)) < cos_tol:
+            return False
+    return True
+
+
+def tangent_face_chain(shape, seed_faces, tol_deg=5.0):
+    """All faces of `shape` reachable from `seed_faces` across shared edges
+    where the surfaces are G1-continuous within `tol_deg` degrees
+    (orientation-agnostic).  Returns a list of faces including the seeds.
+    """
+    cos_tol = math.cos(math.radians(tol_deg)) - 1e-9
+    faces = {f.hashCode(): f for f in shape.Faces}
+    edge_faces = {}  # edge hashCode -> set of face hashCodes sharing it
+    for h, face in faces.items():
+        for edge in face.Edges:
+            try:
+                if edge.Length < 1e-9:  # degenerate seams never connect
+                    continue
+            except Exception:
+                continue
+            edge_faces.setdefault(edge.hashCode(), set()).add(h)
+
+    chain = set()
+    stack = []
+    for seed in seed_faces:
+        h = seed.hashCode()
+        if h in faces and h not in chain:
+            chain.add(h)
+            stack.append(h)
+    while stack:
+        h = stack.pop()
+        face = faces[h]
+        for edge in face.Edges:
+            for other in edge_faces.get(edge.hashCode(), ()):
+                if other in chain:
+                    continue
+                if _g1_across(face, faces[other], edge, cos_tol):
+                    chain.add(other)
+                    stack.append(other)
+    return [faces[h] for h in chain]
+
+
+# ---------------------------------------------------------------- observer
+
+def _alt_is_down():
+    try:
+        from PySide import QtCore, QtWidgets
+    except ImportError:
+        try:
+            from PySide6 import QtCore, QtWidgets
+        except ImportError:
+            from PySide2 import QtCore, QtWidgets
+    return bool(QtWidgets.QApplication.keyboardModifiers()
+                & QtCore.Qt.AltModifier)
+
+
+class _AltChainObserver:
+    """Selection observer that expands Alt+picks into tangent chains."""
+
+    def __init__(self):
+        self._busy = False  # re-entrancy: ignore our own addSelection calls
+
+    def addSelection(self, doc_name, obj_name, sub_name, pos=None):
+        if self._busy or not sub_name:
+            return
+        kind = sub_name[:4]
+        if kind not in ("Edge", "Face") or not sub_name[4:].isdigit():
+            return
+        if not _alt_is_down():
+            return
+        try:
+            import FreeCADGui
+            shape = FreeCAD.getDocument(doc_name).getObject(obj_name).Shape
+        except Exception:
+            return
+        elems = shape.Edges if kind == "Edge" else shape.Faces
+        index = int(sub_name[4:])
+        if not 1 <= index <= len(elems):
+            return
+        chain = tangent_edge_chain if kind == "Edge" else tangent_face_chain
+        found = chain(shape, [elems[index - 1]], _tolerance())
+        index_of = {el.hashCode(): i for i, el in enumerate(elems, 1)}
+        self._busy = True
+        try:
+            for el in found:
+                i = index_of.get(el.hashCode())
+                if i and i != index:
+                    FreeCADGui.Selection.addSelection(
+                        doc_name, obj_name, f"{kind}{i}")
+        finally:
+            self._busy = False
+
+
+def run():
+    try:
+        import FreeCADGui
+    except ImportError:
+        FreeCAD.Console.PrintMessage("AltChainSelect: needs the FreeCAD GUI.\n")
+        return
+    observer = getattr(FreeCAD, _ALT_ATTR, None)
+    if observer is not None:
+        FreeCADGui.Selection.removeObserver(observer)
+        delattr(FreeCAD, _ALT_ATTR)
+        FreeCAD.Console.PrintMessage("AltChainSelect: off.\n")
+    else:
+        observer = _AltChainObserver()
+        FreeCADGui.Selection.addObserver(observer)
+        setattr(FreeCAD, _ALT_ATTR, observer)
+        FreeCAD.Console.PrintMessage(
+            "AltChainSelect: on. Alt+pick an edge or face to select its "
+            "whole tangent chain; run the macro again to turn off.\n")
+
+
+if FreeCAD.GuiUp:
+    run()

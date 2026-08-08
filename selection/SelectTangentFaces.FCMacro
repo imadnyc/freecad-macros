@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Grow the selected face(s) across smooth (G1-continuous) edges.
+
+Select one or more faces, run the macro, and every face reachable from
+them across an edge where the two surfaces meet smoothly (normals within
+tolerance at sampled points along the edge, either orientation) gets
+added to the selection.  On a filleted box one side face sweeps around
+all four sides through the fillets, but never onto the top or bottom.
+
+The tolerance is the float parameter AngleTolerance (degrees) under
+"User parameter:BaseApp/SmartSelect", default 5; one knob tunes the
+whole smart-selection suite.
+"""
+
+__Name__ = "SelectTangentFaces"
+__Comment__ = "Expand the selected faces across G1-continuous edges"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import math
+
+import FreeCAD
+
+SAMPLES = 3  # points sampled along a shared edge for the G1 test
+
+
+def _tolerance():
+    """Suite-wide angle tolerance in degrees (AngleTolerance parameter)."""
+    return FreeCAD.ParamGet(
+        "User parameter:BaseApp/SmartSelect").GetFloat("AngleTolerance", 5.0)
+
+
+# ---------------------------------------------------------------- geometry
+
+def _g1_across(face_a, face_b, edge, cos_tol, samples=SAMPLES):
+    """True if both faces' surface normals agree (up to sign) at `samples`
+    interior points of the shared edge."""
+    try:
+        lo, hi = edge.FirstParameter, edge.LastParameter
+    except Exception:
+        return False
+    for i in range(samples):
+        par = lo + (hi - lo) * (i + 1.0) / (samples + 1.0)
+        try:
+            point = edge.valueAt(par)
+            norm_a = face_a.normalAt(*face_a.Surface.parameter(point))
+            norm_b = face_b.normalAt(*face_b.Surface.parameter(point))
+            norm_a.normalize()
+            norm_b.normalize()
+        except Exception:
+            return False
+        if abs(norm_a.dot(norm_b)) < cos_tol:
+            return False
+    return True
+
+
+def tangent_face_chain(shape, seed_faces, tol_deg=5.0):
+    """All faces of `shape` reachable from `seed_faces` across shared edges
+    where the surfaces are G1-continuous within `tol_deg` degrees
+    (orientation-agnostic).  Returns a list of faces including the seeds.
+    """
+    # the -1e-9 keeps exactly-smooth junctions (|dot| == 1.0) selectable
+    # even at tol_deg = 0
+    cos_tol = math.cos(math.radians(tol_deg)) - 1e-9
+    faces = {f.hashCode(): f for f in shape.Faces}
+    edge_faces = {}  # edge hashCode -> set of face hashCodes sharing it
+    for h, face in faces.items():
+        for edge in face.Edges:
+            try:
+                if edge.Length < 1e-9:  # degenerate seams never connect
+                    continue
+            except Exception:
+                continue
+            edge_faces.setdefault(edge.hashCode(), set()).add(h)
+
+    chain = set()
+    stack = []
+    for seed in seed_faces:
+        h = seed.hashCode()
+        if h in faces and h not in chain:
+            chain.add(h)
+            stack.append(h)
+    while stack:
+        h = stack.pop()
+        face = faces[h]
+        for edge in face.Edges:
+            for other in edge_faces.get(edge.hashCode(), ()):
+                if other in chain:
+                    continue
+                if _g1_across(face, faces[other], edge, cos_tol):
+                    chain.add(other)
+                    stack.append(other)
+    return [faces[h] for h in chain]
+
+
+# --------------------------------------------------------------- gui glue
+
+def run():
+    try:
+        import FreeCADGui
+    except ImportError:
+        FreeCAD.Console.PrintMessage(
+            "SelectTangentFaces: needs the FreeCAD GUI.\n")
+        return
+    picks = {}  # (doc name, obj name) -> (obj, set of 1-based face indices)
+    for sel in FreeCADGui.Selection.getSelectionEx():
+        obj = sel.Object
+        if not hasattr(obj, "Shape"):
+            continue
+        for sub in sel.SubElementNames:
+            if sub.startswith("Face") and sub[4:].isdigit():
+                key = (obj.Document.Name, obj.Name)
+                picks.setdefault(key, (obj, set()))[1].add(int(sub[4:]))
+    if not picks:
+        FreeCAD.Console.PrintMessage(
+            "SelectTangentFaces: select one or more faces first.\n")
+        return
+
+    tol = _tolerance()
+    seed_count = found_count = 0
+    for (doc_name, obj_name), (obj, indices) in picks.items():
+        shape = obj.Shape
+        n = len(shape.Faces)
+        seeds = [shape.Faces[i - 1] for i in indices if 1 <= i <= n]
+        if not seeds:
+            continue
+        found = tangent_face_chain(shape, seeds, tol)
+        index_of = {f.hashCode(): i for i, f in enumerate(shape.Faces, 1)}
+        for face in found:
+            i = index_of.get(face.hashCode())
+            if i:
+                FreeCADGui.Selection.addSelection(
+                    doc_name, obj_name, f"Face{i}")
+        seed_count += len(seeds)
+        found_count += len(found)
+    FreeCAD.Console.PrintMessage(
+        f"SelectTangentFaces: {seed_count} seed face(s) -> {found_count} "
+        f"face(s) in smooth chains (tolerance {tol:g} deg).\n")
+
+
+if FreeCAD.GuiUp:
+    run()

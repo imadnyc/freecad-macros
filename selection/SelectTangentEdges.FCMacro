@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Grow the selected edge(s) along tangent-continuous chains.
+
+Select one or more edges, run the macro, and every edge reachable from
+them through a smoothly continuing vertex (tangents within tolerance,
+either orientation) gets added to the selection.  One pick on a filleted
+top loop selects the whole loop; at a T-junction every tangent branch is
+followed.
+
+The tolerance is the float parameter AngleTolerance (degrees) under
+"User parameter:BaseApp/SmartSelect", default 5; one knob tunes the
+whole smart-selection suite.
+"""
+
+__Name__ = "SelectTangentEdges"
+__Comment__ = "Expand the selected edges along tangent-continuous chains"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import math
+
+import FreeCAD
+
+def _tolerance():
+    """Suite-wide angle tolerance in degrees (AngleTolerance parameter)."""
+    return FreeCAD.ParamGet(
+        "User parameter:BaseApp/SmartSelect").GetFloat("AngleTolerance", 5.0)
+
+
+# ---------------------------------------------------------------- geometry
+
+def _end_tangents(edge):
+    """(vertex hashCode, unit tangent) for each end of `edge`.
+
+    Degenerate edges (zero-length seams, sphere poles) raise on curve
+    access; they yield [] and drop out of the chain graph.
+    """
+    if not edge.Vertexes:
+        return []
+    try:
+        params = (edge.FirstParameter, edge.LastParameter)
+    except Exception:
+        return []
+    ends = []
+    for par in params:
+        try:
+            point = edge.valueAt(par)
+            tang = edge.tangentAt(par)
+        except Exception:
+            continue
+        if tang.Length < 1e-9:
+            continue
+        tang.normalize()
+        # curve endpoints only approximate the vertex position, but the
+        # vertex hashCode is shared exactly between adjacent edges, so
+        # snap to the nearest vertex and key on that
+        vert = min(edge.Vertexes, key=lambda v: (v.Point - point).Length)
+        ends.append((vert.hashCode(), tang))
+    return ends
+
+
+def tangent_edge_chain(shape, seed_edges, tol_deg=5.0):
+    """All edges of `shape` reachable from `seed_edges` across vertices
+    where the meeting edges are tangent within `tol_deg` degrees
+    (orientation-agnostic).  Returns a list of edges including the seeds.
+    """
+    # the -1e-9 keeps exactly-tangent junctions (|dot| == 1.0) selectable
+    # even at tol_deg = 0
+    cos_tol = math.cos(math.radians(tol_deg)) - 1e-9
+    edges = {}  # hashCode -> Edge; dedupes seam repeats, drops degenerates
+    for edge in shape.Edges:
+        try:
+            if edge.Length < 1e-9:
+                continue
+        except Exception:
+            continue
+        edges.setdefault(edge.hashCode(), edge)
+    ends = {h: _end_tangents(e) for h, e in edges.items()}
+    at_vertex = {}  # vertex hashCode -> [(edge hashCode, unit tangent)]
+    for h, edge_ends in ends.items():
+        for vert_hash, tang in edge_ends:
+            at_vertex.setdefault(vert_hash, []).append((h, tang))
+
+    chain = set()
+    stack = []
+    for seed in seed_edges:
+        h = seed.hashCode()
+        if h in edges and h not in chain:
+            chain.add(h)
+            stack.append(h)
+    while stack:
+        h = stack.pop()
+        for vert_hash, tang in ends[h]:
+            for other, other_tang in at_vertex[vert_hash]:
+                if other not in chain and abs(tang.dot(other_tang)) >= cos_tol:
+                    chain.add(other)
+                    stack.append(other)
+    return [edges[h] for h in chain]
+
+
+# --------------------------------------------------------------- gui glue
+
+def run():
+    try:
+        import FreeCADGui
+    except ImportError:
+        FreeCAD.Console.PrintMessage(
+            "SelectTangentEdges: needs the FreeCAD GUI.\n")
+        return
+    picks = {}  # (doc name, obj name) -> (obj, set of 1-based edge indices)
+    for sel in FreeCADGui.Selection.getSelectionEx():
+        obj = sel.Object
+        if not hasattr(obj, "Shape"):
+            continue
+        for sub in sel.SubElementNames:
+            if sub.startswith("Edge") and sub[4:].isdigit():
+                key = (obj.Document.Name, obj.Name)
+                picks.setdefault(key, (obj, set()))[1].add(int(sub[4:]))
+    if not picks:
+        FreeCAD.Console.PrintMessage(
+            "SelectTangentEdges: select one or more edges first.\n")
+        return
+
+    tol = _tolerance()
+    seed_count = found_count = 0
+    for (doc_name, obj_name), (obj, indices) in picks.items():
+        shape = obj.Shape
+        n = len(shape.Edges)
+        seeds = [shape.Edges[i - 1] for i in indices if 1 <= i <= n]
+        if not seeds:
+            continue
+        found = tangent_edge_chain(shape, seeds, tol)
+        index_of = {e.hashCode(): i for i, e in enumerate(shape.Edges, 1)}
+        for edge in found:
+            i = index_of.get(edge.hashCode())
+            if i:
+                FreeCADGui.Selection.addSelection(
+                    doc_name, obj_name, f"Edge{i}")
+        seed_count += len(seeds)
+        found_count += len(found)
+    FreeCAD.Console.PrintMessage(
+        f"SelectTangentEdges: {seed_count} seed edge(s) -> {found_count} "
+        f"edge(s) in tangent chains (tolerance {tol:g} deg).\n")
+
+
+if FreeCAD.GuiUp:
+    run()

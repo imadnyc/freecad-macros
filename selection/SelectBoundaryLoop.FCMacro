@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Select the closed boundary loop a selected edge belongs to.
+
+Loop and tangency are different things: a rectangular pocket floor has a
+boundary loop but zero tangency.  This macro takes each selected edge and
+selects the whole wire it belongs to on an adjacent face.
+
+An edge borders two faces, so two loops qualify.  The wire sharing the
+most edges with your current selection wins; on a tie the first adjacent
+face's wire is taken, and the console says which face that was.
+"""
+
+__Name__ = "SelectBoundaryLoop"
+__Comment__ = "Select the closed boundary loop (wire) a selected edge belongs to"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import FreeCAD
+import Part
+
+# ---------------------------------------------------------------- geometry
+
+def boundary_loop(shape, seed_edge, context_edges=()):
+    """(face, edges) for the wire of a face adjacent to `seed_edge` that
+    contains it.  Prefers the wire sharing the most edges with
+    `context_edges`; ties go to the first adjacent face.  (None, []) if
+    the edge bounds no face.
+    """
+    context = {e.hashCode() for e in context_edges}
+    seed_hash = seed_edge.hashCode()
+    best = None  # (score, face, loop edges)
+    seen = set()
+    for face in shape.ancestorsOfType(seed_edge, Part.Face):
+        if face.hashCode() in seen:
+            continue
+        seen.add(face.hashCode())
+        for wire in face.Wires:
+            edges = {}  # hashCode -> Edge; OCC seams repeat inside a wire
+            for edge in wire.Edges:
+                edges.setdefault(edge.hashCode(), edge)
+            if seed_hash not in edges:
+                continue
+            score = len(context & set(edges))
+            if best is None or score > best[0]:
+                best = (score, face, list(edges.values()))
+    if best is None:
+        return None, []
+    return best[1], best[2]
+
+
+# --------------------------------------------------------------- gui glue
+
+def run():
+    try:
+        import FreeCADGui
+    except ImportError:
+        FreeCAD.Console.PrintMessage(
+            "SelectBoundaryLoop: needs the FreeCAD GUI.\n")
+        return
+    picks = {}  # (doc name, obj name) -> (obj, set of 1-based edge indices)
+    for sel in FreeCADGui.Selection.getSelectionEx():
+        obj = sel.Object
+        if not hasattr(obj, "Shape"):
+            continue
+        for sub in sel.SubElementNames:
+            if sub.startswith("Edge") and sub[4:].isdigit():
+                key = (obj.Document.Name, obj.Name)
+                picks.setdefault(key, (obj, set()))[1].add(int(sub[4:]))
+    if not picks:
+        FreeCAD.Console.PrintMessage(
+            "SelectBoundaryLoop: select one or more edges first.\n")
+        return
+
+    for (doc_name, obj_name), (obj, indices) in picks.items():
+        shape = obj.Shape
+        n = len(shape.Edges)
+        seeds = [shape.Edges[i - 1] for i in indices if 1 <= i <= n]
+        if not seeds:
+            continue
+        edge_index = {e.hashCode(): i for i, e in enumerate(shape.Edges, 1)}
+        face_index = {f.hashCode(): i for i, f in enumerate(shape.Faces, 1)}
+        for seed in seeds:
+            face, loop = boundary_loop(shape, seed, seeds)
+            if face is None:
+                FreeCAD.Console.PrintMessage(
+                    "SelectBoundaryLoop: an edge of "
+                    f"{obj_name} bounds no face, skipped.\n")
+                continue
+            for edge in loop:
+                i = edge_index.get(edge.hashCode())
+                if i:
+                    FreeCADGui.Selection.addSelection(
+                        doc_name, obj_name, f"Edge{i}")
+            FreeCAD.Console.PrintMessage(
+                f"SelectBoundaryLoop: took the {len(loop)}-edge loop on "
+                f"Face{face_index.get(face.hashCode(), '?')} of {obj_name}.\n")
+
+
+if FreeCAD.GuiUp:
+    run()
