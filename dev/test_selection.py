@@ -11,6 +11,7 @@ glue is gated on FreeCAD.GuiUp, so exec'ing them here only defines the
 pure-geometry functions.
 """
 
+import math
 import os
 import traceback
 
@@ -134,24 +135,40 @@ def main():
     assert hashes(got) == sides
 
     # (e) boundary loop on the plain box: a box edge borders two faces, so
-    # a bare seed is ambiguous (some 4-edge loop containing it); a second
-    # context edge makes the top face's loop win by the scoring rule
+    # a bare seed returns one whole adjacent face's wire (never a mixture
+    # of wires); context edges make the intended face win the tie
     loop_ns = load_macro("SelectBoundaryLoop.FCMacro")
     boundary_loop = loop_ns["boundary_loop"]
     box_top = loop_edges(box, 10.0)
     assert len(box_top) == 4
     seed = box_top[0]
+    candidates = [hashes(f.Wires[0].Edges)
+                  for f in box.ancestorsOfType(seed, Part.Face)]
+    assert len(candidates) == 2
     face, loop = boundary_loop(box, seed, [seed])
-    assert face is not None and len(loop) == 4
-    assert seed.hashCode() in hashes(loop)
+    assert hashes(loop) in candidates and len(loop) == 4
     face, loop = boundary_loop(box, seed, [seed, box_top[1]])
     assert hashes(loop) == hashes(box_top)
     assert all(abs(v.Point.z - 10.0) < 1e-6 for v in face.Vertexes)
 
-    # (f) SelectFaceEdges: a box face yields exactly its 4 edges
+    # filleted box: a top-loop seed yields exactly one closed wire, whole
+    # (the 8-edge top wire or the side plane's 4-edge wire, never a mix);
+    # with the top edges as context it is exactly the 8-edge top wire
+    fseed = line_seed(top)
+    fcands = [hashes(f.Wires[0].Edges)
+              for f in fb.ancestorsOfType(fseed, Part.Face)]
+    face, loop = boundary_loop(fb, fseed, [fseed])
+    assert hashes(loop) in fcands
+    face, loop = boundary_loop(fb, fseed, top)
+    assert hashes(loop) == hashes(top) and len(loop) == 8
+
+    # (f) SelectFaceEdges: a box face yields exactly its 4 edges, and the
+    # filleted box's side plane exactly its own 4 (two verticals + 2 lines)
     fedges_ns = load_macro("SelectFaceEdges.FCMacro")
     got = fedges_ns["face_edges"]([box.Faces[0]])
     assert len(got) == 4 and hashes(got) == hashes(box.Faces[0].Edges)
+    got = fedges_ns["face_edges"]([seed_face])
+    assert hashes(got) == hashes(seed_face.Edges) and len(got) == 4
 
     # (g) cylinder seam dedupe: the wall's wire may list the seam twice
     # (OCC convention); the loop result contains it exactly once
@@ -161,11 +178,22 @@ def main():
     assert len(loop_hashes) == len(set(loop_hashes)) == 3
     assert loop_hashes.count(seam.hashCode()) == 1
 
-    # the AngleTolerance parameter read works headless; the value comes
-    # from the user's config (5.0 when unset), so only check the plumbing
-    for ns in (edges_ns, faces_ns, alt_ns):
-        tol = ns["_tolerance"]()
-        assert isinstance(tol, float) and tol > 0.0
+    # the AngleTolerance parameter is live: crank it to 91 and the whole
+    # plain box chains; then restore the user's previous value, or remove
+    # the group entirely if we created it, so the test leaves no trace
+    grp = FreeCAD.ParamGet("User parameter:BaseApp/SmartSelect")
+    prev = grp.GetFloat("AngleTolerance", float("nan"))
+    try:
+        grp.SetFloat("AngleTolerance", 91.0)
+        for ns in (edges_ns, faces_ns, alt_ns):
+            assert ns["_tolerance"]() == 91.0
+        got = edge_chain(box, [box.Edges[0]], edges_ns["_tolerance"]())
+        assert hashes(got) == hashes(box.Edges)
+    finally:
+        if math.isnan(prev):
+            FreeCAD.ParamGet("User parameter:BaseApp").RemGroup("SmartSelect")
+        else:
+            grp.SetFloat("AngleTolerance", prev)
 
     print("SELECTION-TESTS-PASS")
 
