@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""Mesh (STL) to solid in one step: the Shape-from-mesh -> Convert to
+solid -> Refine shape dance, with the guards the GUI dance skips.
+
+Select one or more mesh objects (or have exactly one in the document)
+and run.  Each mesh becomes a Part::Feature solid: the mesh is repaired
+first (duplicates, normals, holes -- only when not watertight), the
+shape is sewn per shell, refined AFTER solidifying (refining a shell is
+a silent no-op, FreeCAD bug #25504), and every step that can silently
+lie -- open shells, invalid solids, filled holes -- is reported instead.
+Curved regions stay planar-faceted: that is inherent to shape-from-mesh
+(one plane per triangle; refine merges only same-surface neighbours and
+never invents a cylinder).  The mesh's own density is the quality knob.
+
+Parameters under "User parameter:BaseApp/ConvertMeshToSolid":
+SewTolerance (0.1) · AutoRepair (True) · Refine (True) · MildUnify
+(False: an extra UnifySameDomain pass, lin 0.5 / ang 0.2 -- trims ~30%
+more faces, safe on the benchmarks but off by default) · FacetWarn
+(10000: confirm before converting bigger meshes) · HideMesh (True).
+"""
+
+__Name__ = "ConvertMeshToSolid"
+__Comment__ = "STL/mesh to refined solid in one step, with honest reporting"
+__Version__ = "1.0.0"
+__License__ = "LGPL-2.1-or-later"
+
+import FreeCAD
+import Part
+
+PARAMS = "User parameter:BaseApp/ConvertMeshToSolid"
+
+
+def _params():
+    p = FreeCAD.ParamGet(PARAMS)
+    return {
+        "sew": p.GetFloat("SewTolerance", 0.1),
+        "repair": p.GetBool("AutoRepair", True),
+        "refine": p.GetBool("Refine", True),
+        "unify": p.GetBool("MildUnify", False),
+        "warn": p.GetInt("FacetWarn", 10000),
+        "hide": p.GetBool("HideMesh", True),
+    }
+
+
+def convert(mesh, p, log):
+    """A Mesh.Mesh -> (shape, watertight) with p from _params().
+
+    The shape is a solid (or compound of solids) when every shell
+    closes, else the open shell so nothing is silently dropped.
+    """
+    m = mesh.copy()
+    if p["repair"]:
+        m.removeDuplicatedPoints()
+        m.removeDuplicatedFacets()
+        m.harmonizeNormals()
+        if not m.isSolid():
+            before = m.CountFacets
+            m.fillupHoles()
+            if m.CountFacets != before:
+                log("holes filled (geometry invented at the gaps)")
+    shape = Part.Shape()
+    shape.makeShapeFromMesh(m.Topology, p["sew"])
+    solids, open_shells = [], 0
+    for shell in shape.Shells:
+        if shell.isClosed():
+            solids.append(Part.Solid(shell))
+        else:
+            open_shells += 1
+    if not solids:
+        log("NOT WATERTIGHT even after repair -> open shell, no solid")
+        return shape, False
+    if open_shells:
+        log(f"{open_shells} open shell(s) dropped alongside the solids")
+    result = solids[0] if len(solids) == 1 else Part.Compound(solids)
+    if len(solids) > 1:
+        log(f"{len(solids)} separate solids -> one compound")
+    if not result.isValid():
+        result.fix(1e-7, 1e-7, 1e-5)
+        log("invalid solid -> fix() applied"
+            + ("" if result.isValid() else " (STILL invalid)"))
+    if p["refine"]:
+        try:
+            result = result.removeSplitter()
+        except Exception:  # noqa: BLE001 -- keep the unrefined solid
+            log("refine failed, keeping the unrefined solid")
+    if p["unify"]:
+        unifier = Part.ShapeUpgrade.UnifySameDomain(result)
+        unifier.setLinearTolerance(0.5)
+        unifier.setAngularTolerance(0.2)
+        unifier.build()
+        result = unifier.shape()
+    return result, True
+
+
+def _targets(doc):
+    """Selected mesh objects, else the document's only mesh."""
+    import FreeCADGui
+    picked = [o for o in FreeCADGui.Selection.getSelection()
+              if o.isDerivedFrom("Mesh::Feature")]
+    if picked:
+        return picked
+    meshes = [o for o in doc.Objects if o.isDerivedFrom("Mesh::Feature")]
+    return meshes if len(meshes) == 1 else []
+
+
+def run():
+    import time
+
+    from PySide import QtWidgets
+    doc = FreeCAD.ActiveDocument
+    if doc is None:
+        FreeCAD.Console.PrintError("ConvertMeshToSolid: no document.\n")
+        return
+    targets = _targets(doc)
+    if not targets:
+        QtWidgets.QMessageBox.information(
+            None, "Convert mesh to solid",
+            "Select the mesh object(s) to convert (or keep exactly one "
+            "mesh in the document).")
+        return
+    p = _params()
+    big = [o for o in targets if o.Mesh.CountFacets > p["warn"]]
+    if big and QtWidgets.QMessageBox.question(
+            None, "Large mesh",
+            f"{big[0].Label} has {big[0].Mesh.CountFacets:,} facets; "
+            "shape-from-mesh gets slow and heavy on large meshes. "
+            "Convert anyway?") != QtWidgets.QMessageBox.Yes:
+        return
+    lines = []
+    doc.openTransaction("Convert mesh to solid")
+    try:
+        for obj in targets:
+            notes = []
+            start = time.perf_counter()
+            shape, watertight = convert(obj.Mesh, p, notes.append)
+            suffix = "_solid" if watertight else "_shell"
+            feature = doc.addObject("Part::Feature", obj.Label + suffix)
+            feature.Shape = shape
+            if p["hide"] and watertight:
+                obj.ViewObject.Visibility = False
+            state = "closed solid" if watertight else "OPEN SHELL"
+            line = (f"{obj.Label}: {obj.Mesh.CountFacets:,} facets -> "
+                    f"{len(shape.Faces):,} faces, {state}, "
+                    f"vol {shape.Volume:.1f} mm^3, "
+                    f"{time.perf_counter() - start:.1f} s")
+            lines.append("; ".join([line] + notes))
+    finally:
+        doc.commitTransaction()
+    doc.recompute()
+    report = "\n".join(lines)
+    FreeCAD.Console.PrintMessage(f"ConvertMeshToSolid:\n{report}\n")
+    QtWidgets.QMessageBox.information(None, "Convert mesh to solid", report)
+
+
+if FreeCAD.GuiUp:
+    run()

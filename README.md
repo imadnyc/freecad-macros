@@ -42,6 +42,19 @@ default 5. Set it once in Tools → Edit parameters… (add the
 the whole suite follows; real-world G1 joints often measure a fraction
 of a degree off, so tighten or loosen to taste.
 
+## mesh/
+
+* **ConvertMeshToSolid.FCMacro** — the STL → solid dance (Shape from
+  mesh → Convert to solid → Refine shape) in one step, with the guards
+  the manual dance skips: mesh repair first, refine *after* solidifying
+  (the other order is a silent no-op, FreeCAD bug #25504), and honest
+  reporting — open shells, filled holes and invalid solids are flagged
+  instead of pretending. Knobs live under `BaseApp/ConvertMeshToSolid`
+  (sew tolerance, auto-repair, refine, an off-by-default extra
+  face-merge pass, large-mesh warning). Curved regions stay
+  planar-faceted — that is inherent to shape-from-mesh; the mesh's own
+  density is the quality knob.
+
 ## Install
 
 Copy the `.FCMacro` files into your macro directory — find it under
